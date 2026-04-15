@@ -579,7 +579,21 @@ def restore_site(bench, site):
             data.get("public"),
             data.get("private"),
             data.get("skip_failing_patches", False),
+            skip_tables=data.get("skip_tables") or [],
         )
+    )
+    return {"job": job}
+
+
+@application.route("/benches/<string:bench>/sites/<string:site>/analyze_backup", methods=["POST"])
+@validate_bench_and_site
+def analyze_backup_route(bench, site):
+    data = request.json
+    job = (
+        Server()
+        .benches[bench]
+        .sites[site]
+        .analyze_backup_job(data["database"])
     )
     return {"job": job}
 

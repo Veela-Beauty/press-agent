@@ -17,6 +17,7 @@ from agent.base import AgentException, Base
 from agent.database import Database
 from agent.job import job, step
 from agent.utils import b2mb, compute_file_hash, get_size
+from agent.backup_analyzer import analyze_backup, filter_sql_stream
 
 if TYPE_CHECKING:
     from agent.bench import Bench
@@ -103,6 +104,22 @@ class Site(Base):
     def uninstall_app(self, app):
         return self.bench_execute(f"uninstall-app {app} --no-backup --yes --force")
 
+
+    def _create_filtered_backup(self, database_file: str, skip_tables: list) -> str:
+        """
+        Stream-filter a .sql.gz backup, removing INSERT statements for
+        skip_tables.  Returns path to the filtered .sql.gz file.
+        The caller is responsible for deleting the returned file.
+        """
+        import gzip as _gzip
+        import io as _io
+
+        filtered_path = database_file.replace(".sql.gz", "-filtered.sql.gz")
+        with _gzip.open(database_file, "rt", encoding="utf-8", errors="replace") as inp:
+            with _gzip.open(filtered_path, "wt", encoding="utf-8") as out:
+                filter_sql_stream(inp, skip_tables=skip_tables, output=out)
+        return filtered_path
+
     @step("Restore Site")
     def restore_site(
         self,
@@ -111,11 +128,19 @@ class Site(Base):
         database_file,
         public_file,
         private_file,
+        skip_tables=None,
     ):
         sites_directory = self.bench.sites_directory
+        filtered_path = None
+
+        # If skip_tables provided, create a filtered copy of the SQL dump
+        if skip_tables:
+            filtered_path = self._create_filtered_backup(database_file, skip_tables)
+            database_file = filtered_path
+
         database_file = database_file.replace(sites_directory, "/home/frappe/frappe-bench/sites")
-        public_file = public_file.replace(sites_directory, "/home/frappe/frappe-bench/sites")
-        private_file = private_file.replace(sites_directory, "/home/frappe/frappe-bench/sites")
+        public_file = public_file.replace(sites_directory, "/home/frappe/frappe-bench/sites") if public_file else None
+        private_file = private_file.replace(sites_directory, "/home/frappe/frappe-bench/sites") if private_file else None
 
         public_file_option = f"--with-public-files {public_file}" if public_file else ""
         private_file_option = f"--with-private-files {private_file} " if private_file else ""
@@ -135,6 +160,8 @@ class Site(Base):
             )
         finally:
             self.bench.drop_mariadb_user(self.name, mariadb_root_password, self.database)
+            if filtered_path and __import__("os").path.exists(filtered_path):
+                __import__("os").unlink(filtered_path)
 
     @step("Restore Files")
     def restore_files(
@@ -189,6 +216,19 @@ class Site(Base):
 
         return {"output": data}
 
+    @job("Analyze Backup")
+    def analyze_backup_job(self, database):
+        """
+        Download a backup file and return table statistics.
+        Used by Press to show pre-restore analysis before the user confirms restore.
+        """
+        files = self.bench.download_files(self.name, database, None, None)
+        try:
+            result = analyze_backup(files["database"])
+        finally:
+            self.bench.delete_downloaded_files(files["directory"])
+        return result
+
     @job("Restore Site")
     def restore_job(
         self,
@@ -199,6 +239,7 @@ class Site(Base):
         public,
         private,
         skip_failing_patches,
+        skip_tables=None,
     ):
         files = self.bench.download_files(self.name, database, public, private)
         is_database_restoration_required = False
@@ -211,6 +252,7 @@ class Site(Base):
                     files["database"],
                     files["public"],
                     files["private"],
+                    skip_tables=skip_tables,
                 )
             else:
                 self.restore_files(
