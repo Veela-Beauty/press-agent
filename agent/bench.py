@@ -730,10 +730,31 @@ class Bench(Base):
 
     @job("Setup Code Server")
     def setup_code_server(self, name, password):
+        self._ensure_code_server_binary()
         self.create_code_server_config(name)
         self._start_code_server(password, setup=True)
         self.generate_nginx_config()
         self.server._reload_nginx()
+
+    @step("Ensure Code Server Binary")
+    def _ensure_code_server_binary(self):
+        """Install code-server inside the bench container if not already present.
+
+        Path B of the 2026-04-22 rollout. Covers containers built from older
+        bench images where the Dockerfile gated code-server install on
+        is_code_server_enabled=True at build time. Idempotent - skips if
+        binary already present. ~30s on first install, ~0.1s on no-op.
+        """
+        try:
+            self.docker_execute("which code-server", non_zero_throw=True)
+            # Binary present; nothing to do
+            return
+        except Exception:
+            pass
+        self.docker_execute(
+            'bash -c "export HOME=/root && curl -fsSL https://code-server.dev/install.sh | sh"',
+            as_root=True,
+        )
 
     @step("Create Code Server Config")
     def create_code_server_config(self, name):
