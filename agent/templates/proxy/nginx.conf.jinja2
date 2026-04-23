@@ -4,7 +4,7 @@ map $host $subdomain_map {
 
 {% for name, upstream in upstreams.items() %}
 upstream {{ upstream["hash"] }} {
-	server {{ name }}:80;
+	server {{ upstream.get("actual_ip", name) }}:80;
 
 	{% for secondary in upstream["secondaries"] %}
 
@@ -23,7 +23,7 @@ upstream {{ upstream["hash"] }} {
 {%- for name, upstream in upstreams.items() %}
 {%- if upstream["secondaries"]|length > 0 %}
 upstream {{ upstream["hash"] }}_primary {
-    server {{ name }}:80;
+    server {{ upstream.get("actual_ip", name) }}:80;
 }
 
 {% endif %}
@@ -72,6 +72,7 @@ map $actual_host $socket_upstream_hash {
 }
 
 map $host $actual_host {
+	hostnames;
 {% for host in hosts.values() -%}
 	{% for from, to in host.items() if from != 'redirect'%}
 	{% if from != 'codeserver' %}

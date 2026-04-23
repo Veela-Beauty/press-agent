@@ -427,9 +427,17 @@ class Proxy(Server):
             upstream_directory = os.path.join(self.upstreams_directory, upstream)
             if not os.path.isdir(upstream_directory):
                 continue
+            # Support IP override for servers without private network
+            ip_override_file = os.path.join(upstream_directory, "ip_override")
+            actual_ip = upstream
+            if os.path.exists(ip_override_file):
+                with open(ip_override_file) as f:
+                    actual_ip = f.read().strip() or upstream
             hashed_upstream = sha(upstream.encode()).hexdigest()[:16]
-            upstreams[upstream] = {"sites": [], "secondaries": [], "hash": hashed_upstream}
+            upstreams[upstream] = {"sites": [], "secondaries": [], "hash": hashed_upstream, "actual_ip": actual_ip}
             for site in os.listdir(upstream_directory):
+                if site == "ip_override":
+                    continue
                 with open(os.path.join(upstream_directory, site)) as f:
                     status = f.read().strip()
                 if status in (

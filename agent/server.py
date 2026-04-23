@@ -57,6 +57,8 @@ class Server(Base):
         return self.config.get("press_url", "https://frappecloud.com")
 
     def docker_login(self, registry):
+        if not registry.get("username") or not registry.get("password"):
+            return
         url = registry["url"]
         username = registry["username"]
         password = registry["password"]
@@ -1117,6 +1119,7 @@ class Server(Base):
                 "conf_directory": os.path.join(self.config.get("benches_directory"), "*", "nginx.conf"),
                 "ip_accept": self.config.get("ip_accept", []),
                 "ip_drop": self.config.get("ip_drop", []),
+                "proxy_conf_path": os.path.join(self.nginx_directory, "proxy.conf") if os.path.exists(os.path.join(self.nginx_directory, "proxy.conf")) else None,
             },
             nginx_config,
         )
