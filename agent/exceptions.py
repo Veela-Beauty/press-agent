@@ -51,3 +51,22 @@ class LowMemoryException(Exception):
             f"need {required_mb} MB. Will retry on next agent poll."
         )
         super().__init__(self.message)
+
+
+class BuildConcurrencyLimitException(Exception):
+    """Raised when a build refuses to start because the per-server build slot
+    cap is already exhausted.
+
+    Press treats this the same as a transient failure and retries; the build
+    runs as soon as another build finishes and releases its slot. Prevents
+    the cascade where 10 deploys land at once and each spawns its own vite
+    build.
+    """
+
+    def __init__(self, max_concurrent_builds: int):
+        self.max_concurrent_builds = max_concurrent_builds
+        self.message = (
+            f"Refusing to start build: {max_concurrent_builds} build(s) "
+            f"already running on this server. Will retry on next agent poll."
+        )
+        super().__init__(self.message)

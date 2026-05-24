@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import shlex
@@ -13,11 +14,17 @@ from typing import TYPE_CHECKING
 import docker
 
 from agent.base import Base
-from agent.exceptions import LowMemoryException, RegistryDownException
+from agent.exceptions import (
+    BuildConcurrencyLimitException,
+    LowMemoryException,
+    RegistryDownException,
+)
 from agent.job import Job, Step, job, step
 from agent.utils import is_registry_healthy
 
-DEFAULT_BUILD_MIN_MEMORY_MB = 3072  # 3 GB free required before starting a build
+DEFAULT_BUILD_MIN_MEMORY_MB = 5120  # 5 GB free required before starting a build
+DEFAULT_MAX_CONCURRENT_BUILDS = 2
+BUILD_SLOTS_DIR = "/tmp/agent-build-slots"
 
 if TYPE_CHECKING:
     from typing import Literal
@@ -93,10 +100,13 @@ class ImageBuilder(Base):
 
     @job("Run Remote Builder")
     def run_remote_builder(self):
+        slot_fd = None
         try:
             self._check_memory_available()
+            slot_fd = self._acquire_build_slot()
             return self._build_and_push()
         finally:
+            self._release_build_slot(slot_fd)
             self._cleanup_context()
 
     @step("Check Memory Available")
@@ -119,6 +129,45 @@ class ImageBuilder(Base):
             )
         return {"available_mb": available_mb, "threshold_mb": threshold_mb}
 
+    @step("Acquire Build Slot")
+    def _acquire_build_slot(self):
+        """Try to grab one of N concurrent build slots via non-blocking flock.
+
+        Slot files live under BUILD_SLOTS_DIR (slot_0, slot_1, ...). Each
+        running build holds an exclusive flock on one slot file. When the
+        build process exits — clean or crash — the kernel releases the
+        lock automatically. No PID files to clean up, no stale-lock bug.
+
+        If all slots are held, raises BuildConcurrencyLimitException; Press
+        marks the job Failure and retries on next poll.
+        """
+        max_builds = self._get_max_concurrent_builds()
+        os.makedirs(BUILD_SLOTS_DIR, exist_ok=True)
+        for slot_index in range(max_builds):
+            slot_path = os.path.join(BUILD_SLOTS_DIR, f"slot_{slot_index}")
+            fd = os.open(slot_path, os.O_CREAT | os.O_RDWR, 0o644)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                os.close(fd)
+                continue
+            os.write(fd, f"{os.getpid()} {datetime.now().isoformat()}\n".encode())
+            os.fsync(fd)
+            return fd
+        raise BuildConcurrencyLimitException(max_concurrent_builds=max_builds)
+
+    def _release_build_slot(self, slot_fd):
+        if slot_fd is None:
+            return
+        try:
+            fcntl.flock(slot_fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(slot_fd)
+        except OSError:
+            pass
+
     def _get_build_memory_threshold_mb(self) -> int:
         # Read once per build from server config (no agent restart needed
         # when an operator tunes the threshold via config.json).
@@ -128,6 +177,14 @@ class ImageBuilder(Base):
             return int(cfg.get("build_min_memory_mb") or DEFAULT_BUILD_MIN_MEMORY_MB)
         except (FileNotFoundError, ValueError, json.JSONDecodeError):
             return DEFAULT_BUILD_MIN_MEMORY_MB
+
+    def _get_max_concurrent_builds(self) -> int:
+        try:
+            with open(self.config_file) as f:
+                cfg = json.load(f)
+            return int(cfg.get("max_concurrent_builds") or DEFAULT_MAX_CONCURRENT_BUILDS)
+        except (FileNotFoundError, ValueError, json.JSONDecodeError):
+            return DEFAULT_MAX_CONCURRENT_BUILDS
 
     def _build_and_push(self):
         self._build_image()
