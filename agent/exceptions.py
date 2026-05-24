@@ -32,3 +32,22 @@ class InvalidSiteConfigException(AgentException):
 class RegistryDownException(Exception):
     def __init__(self, data):
         self.data = data
+
+
+class LowMemoryException(Exception):
+    """Raised when a build refuses to start because the host is low on RAM.
+
+    Press's agent-job poller marks the job as Failure on this exception;
+    Press auto-retries Failed builds on its normal schedule, so the build
+    will run as soon as memory frees. Prevents OOM cascades when many
+    deploys land at the same second.
+    """
+
+    def __init__(self, available_mb: int, required_mb: int):
+        self.available_mb = available_mb
+        self.required_mb = required_mb
+        self.message = (
+            f"Refusing to start build: only {available_mb} MB available, "
+            f"need {required_mb} MB. Will retry on next agent poll."
+        )
+        super().__init__(self.message)

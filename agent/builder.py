@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import subprocess
@@ -12,9 +13,11 @@ from typing import TYPE_CHECKING
 import docker
 
 from agent.base import Base
-from agent.exceptions import RegistryDownException
+from agent.exceptions import LowMemoryException, RegistryDownException
 from agent.job import Job, Step, job, step
 from agent.utils import is_registry_healthy
+
+DEFAULT_BUILD_MIN_MEMORY_MB = 3072  # 3 GB free required before starting a build
 
 if TYPE_CHECKING:
     from typing import Literal
@@ -91,9 +94,40 @@ class ImageBuilder(Base):
     @job("Run Remote Builder")
     def run_remote_builder(self):
         try:
+            self._check_memory_available()
             return self._build_and_push()
         finally:
             self._cleanup_context()
+
+    @step("Check Memory Available")
+    def _check_memory_available(self):
+        """Refuse to start build if free RAM is below the configured threshold.
+
+        Prevents OOM cascades when Press lands many parallel deploys on a
+        host already running benches. The job fails fast (no docker layers
+        attempted, no context wasted); Press auto-retries on next poll, so
+        the build runs as soon as memory frees.
+        """
+        import psutil
+
+        threshold_mb = self._get_build_memory_threshold_mb()
+        available_mb = psutil.virtual_memory().available // (1024 * 1024)
+        if available_mb < threshold_mb:
+            raise LowMemoryException(
+                available_mb=available_mb,
+                required_mb=threshold_mb,
+            )
+        return {"available_mb": available_mb, "threshold_mb": threshold_mb}
+
+    def _get_build_memory_threshold_mb(self) -> int:
+        # Read once per build from server config (no agent restart needed
+        # when an operator tunes the threshold via config.json).
+        try:
+            with open(self.config_file) as f:
+                cfg = json.load(f)
+            return int(cfg.get("build_min_memory_mb") or DEFAULT_BUILD_MIN_MEMORY_MB)
+        except (FileNotFoundError, ValueError, json.JSONDecodeError):
+            return DEFAULT_BUILD_MIN_MEMORY_MB
 
     def _build_and_push(self):
         self._build_image()
