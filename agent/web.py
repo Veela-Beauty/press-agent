@@ -1483,7 +1483,11 @@ def ssh_add_user():
 
 @application.route("/ssh/users/<string:user>", methods=["DELETE"])
 def ssh_remove_user(user):
-    job = SSHProxy().remove_user_job(user)
+    # Press fork sends {"ssh": {"ip", "port"}} so the agent can also
+    # clean up the container's hostkey from /etc/ssh/ssh_known_hosts.
+    # Older Press callers send no body; remove_user_job tolerates ssh=None.
+    data = request.get_json(silent=True) or {}
+    job = SSHProxy().remove_user_job(user, ssh=data.get("ssh"))
     return {"job": job}
 
 
