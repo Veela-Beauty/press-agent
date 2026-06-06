@@ -17,7 +17,7 @@ from agent.base import AgentException, Base
 from agent.database import Database
 from agent.job import job, step
 from agent.utils import b2mb, compute_file_hash, get_size
-from agent.backup_analyzer import analyze_backup, filter_sql_stream
+from agent.backup_analyzer import analyze_backup, analyze_backup_from_url, filter_sql_stream
 
 if TYPE_CHECKING:
     from agent.bench import Bench
@@ -219,15 +219,26 @@ class Site(Base):
     @job("Analyze Backup")
     def analyze_backup_job(self, database):
         """
-        Download a backup file and return table statistics.
-        Used by Press to show pre-restore analysis before the user confirms restore.
+        Return table statistics for a backup so Press can show pre-restore analysis.
+
+        Fast path: stream the dump straight through the (multi-core) decompressor and
+        scan it without writing it to disk, so download/decompress/scan overlap. On any
+        failure, fall back to the original download-to-disk path (analyze_backup, also
+        pigz-accelerated).
         """
-        files = self.bench.download_files(self.name, database, None, None)
+        if not database:
+            return {"tables": {}, "noise_tables": [], "noise_row_count": 0, "total_row_count": 0}
         try:
-            result = analyze_backup(files["database"])
-        finally:
-            self.bench.delete_downloaded_files(files["directory"])
-        return result
+            return analyze_backup_from_url(database)
+        except Exception as exc:
+            # Don't fail the analysis — fall back to the proven download-to-disk path,
+            # but surface why (captured in the job log) so a silently-slow fast path is visible.
+            print(f"analyze_backup_from_url failed ({exc!r}); falling back to download", flush=True)
+            files = self.bench.download_files(self.name, database, None, None)
+            try:
+                return analyze_backup(files["database"])
+            finally:
+                self.bench.delete_downloaded_files(files["directory"])
 
     @job("Restore Site")
     def restore_job(
