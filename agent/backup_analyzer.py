@@ -8,7 +8,10 @@ Provides:
 from __future__ import annotations
 
 import gzip
+import io
 import re
+import shutil
+import subprocess
 from typing import IO
 
 # Tables that are safe to skip during restore — they are large, noisy,
@@ -36,55 +39,36 @@ _INSERT_RE = re.compile(r"^INSERT INTO `(.+?)`")
 _TUPLE_RE = re.compile(r"\(")
 
 
-def analyze_backup(path: str) -> dict:
-    """
-    Stream-scan a .sql.gz backup file and return table statistics.
+def _scan_stream(f: IO[str]) -> dict:
+    """Scan an open text SQL stream and return table statistics.
 
-    Returns:
-        {
-            "tables": {
-                "tabActivity Log": {"rows": 50000, "noise": True},
-                "tabCustom Field": {"rows": 200, "noise": False},
-            },
-            "noise_tables": ["tabActivity Log", ...],
-            "noise_row_count": 50000,
-            "total_row_count": 50200,
-        }
+    Pure scan logic, identical whether the bytes come from a file on disk or a
+    streamed download — so output is unchanged regardless of the decompressor used.
     """
     tables: dict[str, dict] = {}
     current_table: str | None = None
 
-    opener = gzip.open if path.endswith(".gz") else open
-    with opener(path, "rt", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            # Detect table section header
-            m = _DUMP_HEADER_RE.match(line)
-            if m:
-                current_table = m.group(1)
-                if current_table not in tables:
-                    tables[current_table] = {"rows": 0, "noise": current_table in NOISE_TABLES}
-                continue
+    for line in f:
+        # Detect table section header
+        m = _DUMP_HEADER_RE.match(line)
+        if m:
+            current_table = m.group(1)
+            if current_table not in tables:
+                tables[current_table] = {"rows": 0, "noise": current_table in NOISE_TABLES}
+            continue
 
-            # Count rows in INSERT statements
-            if current_table and line.startswith("INSERT INTO"):
-                # Count value tuples by counting opening parens after VALUES keyword
-                # Works for both single-line and multi-line inserts
-                row_count = line.count("),(") + (1 if "(" in line else 0)
-                # More accurate: count top-level ( that start a row tuple
-                # For simplicity, count commas between ) and ( as row separators
-                # Pattern: VALUES (row1),(row2),(row3)
-                # Split on "VALUES" and count tuples
-                if "VALUES" in line.upper():
-                    after_values = line[line.upper().index("VALUES") + 6:]
-                    # Count the number of '),(' separators + 1 = row count
-                    row_count = after_values.count("),(") + 1
-                    tables[current_table]["rows"] += row_count
-                else:
-                    # Multi-line INSERT continuation — count top-level tuples
-                    # Each line starting with ( is a row
-                    tables[current_table]["rows"] += line.count("),(") + (
-                        1 if line.strip().startswith("(") else 0
-                    )
+        # Count rows in INSERT statements
+        if current_table and line.startswith("INSERT INTO"):
+            # Pattern: VALUES (row1),(row2),(row3) -> tuples = '),(' separators + 1
+            upper = line.upper()
+            if "VALUES" in upper:
+                after_values = line[upper.index("VALUES") + 6:]
+                tables[current_table]["rows"] += after_values.count("),(") + 1
+            else:
+                # Multi-line INSERT continuation — each line starting with ( is a row
+                tables[current_table]["rows"] += line.count("),(") + (
+                    1 if line.strip().startswith("(") else 0
+                )
 
     noise_tables = [t for t in tables if tables[t]["noise"] and tables[t]["rows"] > 0]
     noise_row_count = sum(tables[t]["rows"] for t in noise_tables)
@@ -96,6 +80,93 @@ def analyze_backup(path: str) -> dict:
         "noise_row_count": noise_row_count,
         "total_row_count": total_row_count,
     }
+
+
+def _decompressor() -> list[str] | None:
+    """argv prefix for a multi-core decompressor (pigz), else single-core gunzip, else None."""
+    if shutil.which("pigz"):
+        return ["pigz", "-dc"]
+    if shutil.which("gunzip"):
+        return ["gunzip", "-c"]
+    return None
+
+
+def analyze_backup(path: str) -> dict:
+    """
+    Scan a .sql.gz (or .sql) backup file on disk and return table statistics.
+
+    Decompresses with pigz (multi-core) when available — far faster than Python's
+    single-threaded gzip on large dumps — and falls back to Python gzip otherwise.
+
+    Returns:
+        {
+            "tables": {"tabActivity Log": {"rows": 50000, "noise": True}, ...},
+            "noise_tables": ["tabActivity Log", ...],
+            "noise_row_count": 50000,
+            "total_row_count": 50200,
+        }
+    """
+    if path.endswith(".gz"):
+        decomp = _decompressor()
+        if decomp:
+            proc = subprocess.Popen(decomp + [path], stdout=subprocess.PIPE)
+            try:
+                # TextIOWrapper owns proc.stdout; closing it (via `with`) closes the pipe.
+                with io.TextIOWrapper(proc.stdout, encoding="utf-8", errors="replace") as f:
+                    result = _scan_stream(f)
+            finally:
+                proc.wait()
+            if proc.returncode not in (0, None):
+                raise RuntimeError(f"{decomp[0]} failed (rc={proc.returncode}) for {path}")
+            return result
+        with gzip.open(path, "rt", encoding="utf-8", errors="replace") as f:
+            return _scan_stream(f)
+    with open(path, "rt", encoding="utf-8", errors="replace") as f:
+        return _scan_stream(f)
+
+
+def analyze_backup_from_url(url: str) -> dict:
+    """
+    Stream a remote .sql.gz straight through the decompressor and scan it WITHOUT
+    writing the full backup to disk: curl -> pigz -dc -> scan, so download,
+    decompression and scanning all overlap. Raises on any pipe/HTTP failure so the
+    caller can fall back to the download-then-analyze_backup path.
+    """
+    decomp = _decompressor()
+    if not decomp:
+        raise RuntimeError("no external decompressor (pigz/gunzip) available for streaming analyze")
+
+    curl = subprocess.Popen(
+        ["curl", "-fsSL", "--retry", "2", url],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        pig = subprocess.Popen(decomp, stdin=curl.stdout, stdout=subprocess.PIPE)
+    except Exception:
+        curl.kill()
+        curl.wait()
+        raise
+    if curl.stdout:
+        curl.stdout.close()  # parent drops its handle so curl gets SIGPIPE if pig exits early
+
+    curl_err = b""
+    try:
+        # TextIOWrapper owns pig.stdout; closing it (via `with`) closes the pipe.
+        with io.TextIOWrapper(pig.stdout, encoding="utf-8", errors="replace") as f:
+            result = _scan_stream(f)
+    finally:
+        pig.wait()
+        if curl.stderr:
+            curl_err = curl.stderr.read()
+        curl.wait()
+
+    if curl.returncode not in (0, None):
+        detail = curl_err.decode("utf-8", "replace").strip()[:200]
+        raise RuntimeError(f"curl failed (rc={curl.returncode}) streaming backup: {detail}")
+    if pig.returncode not in (0, None):
+        raise RuntimeError(f"{decomp[0]} failed (rc={pig.returncode}) streaming backup")
+    return result
 
 
 def filter_sql_stream(
