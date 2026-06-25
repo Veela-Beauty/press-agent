@@ -1142,6 +1142,7 @@ class Server(Base):
                 "pages_directory": os.path.join(self.directory, "repo", "agent", "pages"),
                 "tls_protocols": self.config.get("tls_protocols"),
                 "press_url": self.config.get("press_url"),
+                "web_https_port": self.config.get("web_https_port", 443),
             },
             agent_nginx_config,
         )

@@ -547,6 +547,8 @@ class Bench(Base):
             "nginx_directory": self.server.nginx_directory,
             "tls_protocols": self.server.config.get("tls_protocols"),
             "code_server": codeserver,
+            "web_https_port": self.server.config.get("web_https_port", 443),
+            "web_http_port": self.server.config.get("web_http_port", 80),
         }
         nginx_config = os.path.join(self.directory, "nginx.conf")
 
