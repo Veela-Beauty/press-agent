@@ -57,6 +57,8 @@ class Server(Base):
         return self.config.get("press_url", "https://frappecloud.com")
 
     def docker_login(self, registry):
+        if not registry.get("username") or not registry.get("password"):
+            return
         url = registry["url"]
         username = registry["username"]
         password = registry["password"]
