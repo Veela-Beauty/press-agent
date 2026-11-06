@@ -22,6 +22,7 @@ import requests
 
 from agent.app import App
 from agent.base import AgentException, Base
+from agent.code_server import start_code_server as start_code_server_in_container
 from agent.exceptions import InvalidSiteConfigException, SiteNotExistsException
 from agent.job import job, step
 from agent.site import Site
@@ -770,13 +771,7 @@ class Bench(Base):
 
     @step("Start Code Server")
     def _start_code_server(self, password, setup=False):
-        if setup:
-            self.docker_execute("supervisorctl start code-server:")
-
-        self.docker_execute(
-            f"sed -i 's/^password:.*/password: {password}/' /home/frappe/.config/code-server/config.yaml"
-        )
-        self.docker_execute("supervisorctl restart code-server:")
+        start_code_server_in_container(self, password)
 
     @step("Stop Code Server")
     def _stop_code_server(self):
